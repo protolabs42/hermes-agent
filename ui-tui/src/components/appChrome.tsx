@@ -4,35 +4,64 @@ import { type ReactNode, type RefObject, useCallback, useEffect, useMemo, useSta
 
 import { $delegationState } from '../app/delegationStore.js'
 import { $turnState } from '../app/turnStore.js'
-import { FACES } from '../content/faces.js'
-import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
 import type { Theme } from '../theme.js'
-import type { Msg, Usage } from '../types.js'
+import type { ActiveTool, Msg, Usage } from '../types.js'
 
-const FACE_TICK_MS = 2500
+import { Spinner } from './thinking.js'
+
 const HEART_COLORS = ['#ff5fa2', '#ff4d6d']
+const AURORA_STATUS_IDENTITY = 'Aurora Proto'
 
-function FaceTicker({ color, startedAt }: { color: string; startedAt?: null | number }) {
-  const [tick, setTick] = useState(() => Math.floor(Math.random() * 1000))
-  const [now, setNow] = useState(() => Date.now())
+export interface CognitivePhaseInput {
+  busy: boolean
+  reasoningStreaming?: boolean
+  streaming?: string
+  tools?: ActiveTool[]
+  turnTrail?: string[]
+}
 
-  useEffect(() => {
-    const face = setInterval(() => setTick(n => n + 1), FACE_TICK_MS)
-    const clock = setInterval(() => setNow(Date.now()), 1000)
+export type CognitivePhase = {
+  beads: string
+  color: 'idle' | 'thinking' | 'tool' | 'integrating'
+  spinner: 'think' | 'tool'
+}
 
-    return () => {
-      clearInterval(face)
-      clearInterval(clock)
-    }
-  }, [])
+export function buildCognitivePhase({
+  busy,
+  reasoningStreaming = false,
+  streaming = '',
+  tools = [],
+  turnTrail = []
+}: CognitivePhaseInput): CognitivePhase | null {
+  if (!busy) {
+    return null
+  }
+
+  if (tools.length > 0) {
+    return { beads: '⚙◐◇', color: 'tool', spinner: 'tool' }
+  }
+
+  if (turnTrail.length > 0) {
+    return { beads: '◇◐✦', color: 'integrating', spinner: 'think' }
+  }
+
+  if (reasoningStreaming || streaming.trim()) {
+    return { beads: '◐◇✦', color: 'thinking', spinner: 'think' }
+  }
+
+  return { beads: '◐✦◇', color: 'thinking', spinner: 'think' }
+}
+
+function CognitivePhaseGlyphs({ phase, t }: { phase: CognitivePhase; t: Theme }) {
+  const color = phase.color === 'tool' ? t.color.amber : phase.color === 'integrating' ? t.color.gold : t.color.statusGood
 
   return (
     <Text color={color}>
-      {FACES[tick % FACES.length]} {VERBS[tick % VERBS.length]}…{startedAt ? ` · ${fmtDuration(now - startedAt)}` : ''}
+      <Spinner color={color} variant={phase.spinner} /> {phase.beads}
     </Text>
   )
 }
@@ -62,6 +91,71 @@ function ctxBar(pct: number | undefined, w = 10) {
   const filled = Math.round((p / 100) * w)
 
   return '█'.repeat(filled) + '░'.repeat(w - filled)
+}
+
+export function formatPromptElapsed(ms: number | null | undefined, live = false) {
+  if (!ms || ms < 0) {
+    return live ? '⏱ 0s' : '⏲ 0s'
+  }
+
+  return `${live ? '⏱' : '⏲'} ${fmtDuration(ms)}`
+}
+
+export function formatSessionElapsed(ms: number | null | undefined) {
+  if (!ms || ms < 0) {
+    return '0m'
+  }
+
+  const totalSeconds = Math.floor(ms / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`
+  }
+
+  return `${minutes}m`
+}
+
+export function buildAuroraStatusParts({
+  model,
+  promptElapsedMs,
+  promptElapsedLive = false,
+  sessionElapsedMs,
+  t,
+  usage
+}: {
+  model: string
+  promptElapsedLive?: boolean
+  promptElapsedMs?: null | number
+  sessionElapsedMs?: null | number
+  t: Theme
+  usage: Usage
+}): { color: string; text: string }[] {
+  const pct = usage.context_percent
+  const barColor = ctxBarColor(pct, t)
+  const parts = [{ color: t.color.label, text: `${t.brand.icon} ${AURORA_STATUS_IDENTITY}` }]
+
+  if (model) {
+    parts.push({ color: t.color.dim, text: ` │ ${model}` })
+  }
+
+  if (usage.context_max) {
+    parts.push({ color: t.color.dim, text: ` │ ctx ${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}` })
+    parts.push({ color: barColor, text: ` │ [${ctxBar(pct)}] ${pct != null ? `${pct}%` : ''}` })
+  } else if (usage.total > 0) {
+    parts.push({ color: t.color.dim, text: ` │ ${fmtK(usage.total)} tok` })
+  }
+
+  if (sessionElapsedMs != null) {
+    parts.push({ color: t.color.dim, text: ` │ ${formatSessionElapsed(sessionElapsedMs)}` })
+  }
+
+  if (promptElapsedMs != null) {
+    parts.push({ color: t.color.dim, text: ` │ ${formatPromptElapsed(promptElapsedMs, promptElapsedLive)}` })
+  }
+
+  return parts
 }
 
 function SpawnHud({ t }: { t: Theme }) {
@@ -129,13 +223,33 @@ function SessionDuration({ startedAt }: { startedAt: number }) {
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+
+    return () => clearInterval(id)
+  }, [])
+
+  return formatSessionElapsed(now - startedAt)
+}
+
+function PromptElapsed({ live, ms, startedAt }: { live: boolean; ms?: null | number; startedAt?: null | number }) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!startedAt) {
+      return
+    }
+
     setNow(Date.now())
     const id = setInterval(() => setNow(Date.now()), 1000)
 
     return () => clearInterval(id)
   }, [startedAt])
 
-  return fmtDuration(now - startedAt)
+  if (startedAt) {
+    return formatPromptElapsed(now - startedAt, true)
+  }
+
+  return formatPromptElapsed(ms, live)
 }
 
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
@@ -167,51 +281,59 @@ export function StatusRule({
   cwdLabel,
   cols,
   busy,
-  status,
-  statusColor,
   model,
   usage,
   bgCount,
+  promptElapsedMs,
   sessionStartedAt,
   showCost,
   turnStartedAt,
   voiceLabel,
   t
 }: StatusRuleProps) {
-  const pct = usage.context_percent
-  const barColor = ctxBarColor(pct, t)
-
-  const ctxLabel = usage.context_max
-    ? `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-    : usage.total > 0
-      ? `${fmtK(usage.total)} tok`
-      : ''
-
-  const bar = usage.context_max ? ctxBar(pct) : ''
   const leftWidth = Math.max(12, cols - cwdLabel.length - 3)
+  const turn = useStore($turnState)
+
+  const phase = buildCognitivePhase({
+    busy,
+    reasoningStreaming: turn.reasoningStreaming,
+    streaming: turn.streaming,
+    tools: turn.tools,
+    turnTrail: turn.turnTrail
+  })
 
   return (
     <Box height={1}>
       <Box flexShrink={1} width={leftWidth}>
         <Text color={t.color.bronze} wrap="truncate-end">
           {'─ '}
-          {busy ? (
-            <FaceTicker color={statusColor} startedAt={turnStartedAt} />
-          ) : (
-            <Text color={statusColor}>{status}</Text>
-          )}
-          <Text color={t.color.dim}> │ {model}</Text>
-          {ctxLabel ? <Text color={t.color.dim}> │ {ctxLabel}</Text> : null}
-          {bar ? (
-            <Text color={t.color.dim}>
-              {' │ '}
-              <Text color={barColor}>[{bar}]</Text> <Text color={barColor}>{pct != null ? `${pct}%` : ''}</Text>
+          {buildAuroraStatusParts({
+            model,
+            promptElapsedMs: null,
+            sessionElapsedMs: null,
+            t,
+            usage
+          }).map((part, idx) => (
+            <Text color={part.color} key={idx}>
+              {part.text}
             </Text>
-          ) : null}
+          ))}
           {sessionStartedAt ? (
             <Text color={t.color.dim}>
               {' │ '}
               <SessionDuration startedAt={sessionStartedAt} />
+            </Text>
+          ) : null}
+          {(turnStartedAt || promptElapsedMs != null) && (
+            <Text color={t.color.dim}>
+              {' │ '}
+              <PromptElapsed live={busy} ms={promptElapsedMs} startedAt={turnStartedAt} />
+            </Text>
+          )}
+          {phase ? (
+            <Text>
+              {' │ '}
+              <CognitivePhaseGlyphs phase={phase} t={t} />
             </Text>
           ) : null}
           <SpawnHud t={t} />
@@ -374,6 +496,7 @@ interface StatusRuleProps {
   cols: number
   cwdLabel: string
   model: string
+  promptElapsedMs?: null | number
   sessionStartedAt?: null | number
   showCost: boolean
   status: string

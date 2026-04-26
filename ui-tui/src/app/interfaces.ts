@@ -60,6 +60,7 @@ export interface OverlayState {
   agentsInitialHistoryIndex: number
   approval: ApprovalReq | null
   clarify: ClarifyReq | null
+  commandPalette: null | { query?: string }
   confirm: ConfirmReq | null
   modelPicker: boolean
   pager: null | PagerState
@@ -88,6 +89,7 @@ export interface UiState {
   detailsMode: DetailsMode
   info: null | SessionInfo
   inlineDiffs: boolean
+  mouseTracking: boolean
   sections: SectionVisibility
   showCost: boolean
   showReasoning: boolean
@@ -281,12 +283,14 @@ export interface AppLayoutActions {
   answerClarify: (answer: string) => void
   answerSecret: (value: string) => void
   answerSudo: (pw: string) => void
+  onCommandSelect: (value: string) => void
   onModelSelect: (value: string) => void
   resumeById: (id: string) => void
   setStickyPrompt: (value: string) => void
 }
 
 export interface AppLayoutComposerProps {
+  catalog: null | SlashCatalog
   cols: number
   compIdx: number
   completions: CompletionItem[]
@@ -322,6 +326,7 @@ export interface AppLayoutProgressProps {
 export interface AppLayoutStatusProps {
   cwdLabel: string
   goodVibesTick: number
+  promptElapsedMs: null | number
   sessionStartedAt: null | number
   showStickyPrompt: boolean
   statusColor: string
@@ -347,11 +352,13 @@ export interface AppLayoutProps {
 }
 
 export interface AppOverlaysProps {
+  catalog: null | SlashCatalog
   cols: number
   compIdx: number
   completions: CompletionItem[]
   onApprovalChoice: (choice: string) => void
   onClarifyAnswer: (value: string) => void
+  onCommandSelect: (value: string) => void
   onModelSelect: (value: string) => void
   onPickerSelect: (sessionId: string) => void
   onSecretSubmit: (value: string) => void

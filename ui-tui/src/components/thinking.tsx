@@ -1,5 +1,5 @@
 import { Box, NoSelect, Text } from '@hermes/ink'
-import { memo, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { memo, type ReactNode, useEffect, useMemo, useState } from 'react'
 import spinners, { type BrailleSpinnerName } from 'unicode-animations'
 
 import { THINKING_COT_MAX } from '../config/limits.js'
@@ -15,16 +15,8 @@ import {
   treeTotals,
   widthByDepth
 } from '../lib/subagentTree.js'
-import {
-  compactPreview,
-  estimateTokensRough,
-  fmtK,
-  formatToolCall,
-  parseToolTrailResultLine,
-  pick,
-  thinkingPreview,
-  toolTrailLabel
-} from '../lib/text.js'
+import { compactPreview, estimateTokensRough, fmtK, formatToolCall, pick, thinkingPreview, toolTrailLabel } from '../lib/text.js'
+import { buildToolStreamSummary, classifyToolStreamTrailLine, toolStreamRune, type ToolStreamTone } from '../lib/toolStream.js'
 import type { Theme } from '../theme.js'
 import type {
   ActiveTool,
@@ -392,6 +384,9 @@ function SubagentAccordion({
   const hasTools = item.tools.length > 0
   const noteRows = [...(summary ? [summary] : []), ...item.notes]
   const hasNotes = noteRows.length > 0
+  // `showChildren` only seeds the recursive `expanded` prop for nested
+  // subagents — it MUST NOT be OR-ed into the local section toggles, or
+  // expand-all permanently locks the inner chevrons open.
   const showChildren = expanded || deep
   const noteColor = statusTone === 'error' ? t.color.error : statusTone === 'warn' ? t.color.warn : t.color.dim
 
@@ -414,13 +409,13 @@ function SubagentAccordion({
               setOpenThinking(v => !v)
             }
           }}
-          open={showChildren || openThinking}
+          open={openThinking}
           t={t}
           title="Thinking"
         />
       ),
       key: 'thinking',
-      open: showChildren || openThinking,
+      open: openThinking,
       render: childRails => (
         <Thinking
           active={item.status === 'running'}
@@ -447,13 +442,13 @@ function SubagentAccordion({
               setOpenTools(v => !v)
             }
           }}
-          open={showChildren || openTools}
+          open={openTools}
           t={t}
           title="Tool calls"
         />
       ),
       key: 'tools',
-      open: showChildren || openTools,
+      open: openTools,
       render: childRails => (
         <Box flexDirection="column">
           {item.tools.map((line, index) => (
@@ -488,14 +483,14 @@ function SubagentAccordion({
               setOpenNotes(v => !v)
             }
           }}
-          open={showChildren || openNotes}
+          open={openNotes}
           t={t}
           title="Progress"
           tone={statusTone}
         />
       ),
       key: 'notes',
-      open: showChildren || openNotes,
+      open: openNotes,
       render: childRails => (
         <Box flexDirection="column">
           {noteRows.map((line, index) => (
@@ -528,14 +523,14 @@ function SubagentAccordion({
               setOpenKids(v => !v)
             }
           }}
-          open={showChildren || openKids}
+          open={openKids}
           suffix={`d${item.depth + 1} · ${aggregate.descendantCount} total`}
           t={t}
           title="Spawned"
         />
       ),
       key: 'subagents',
-      open: showChildren || openKids,
+      open: openKids,
       render: childRails => (
         <Box flexDirection="column">
           {children.map((child, i) => (
@@ -674,6 +669,8 @@ interface Group {
   details: DetailRow[]
   key: string
   label: string
+  rune: string
+  tone: ToolStreamTone
 }
 
 export const ToolTrail = memo(function ToolTrail({
@@ -718,6 +715,13 @@ export const ToolTrail = memo(function ToolTrail({
   )
 
   const [now, setNow] = useState(() => Date.now())
+  // Local toggles own the open state once mounted.  Init from the resolved
+  // section visibility so default-expanded sections (thinking/tools) render
+  // open on first paint; the useEffect below re-syncs when the user mutates
+  // visibility at runtime via /details.  NEVER OR these against
+  // `visible.X === 'expanded'` at render time — that locks the panel open
+  // and silently breaks manual chevron clicks for default-expanded
+  // sections (regression caught after #14968).
   const [openThinking, setOpenThinking] = useState(visible.thinking === 'expanded')
   const [openTools, setOpenTools] = useState(visible.tools === 'expanded')
   const [openSubagents, setOpenSubagents] = useState(visible.subagents === 'expanded')
@@ -773,22 +777,24 @@ export const ToolTrail = memo(function ToolTrail({
   const pushDetail = (row: DetailRow) => (groups.at(-1)?.details ?? meta).push(row)
 
   for (const [i, line] of trail.entries()) {
-    const parsed = parseToolTrailResultLine(line)
+    const classified = classifyToolStreamTrailLine(line)
 
-    if (parsed) {
+    if (classified.mark) {
       groups.push({
-        color: parsed.mark === '✗' ? t.color.error : t.color.cornsilk,
-        content: parsed.detail ? parsed.call : `${parsed.call} ${parsed.mark}`,
+        color: classified.tone === 'error' ? t.color.error : t.color.cornsilk,
+        content: classified.detail ? classified.label : `${classified.label} ${classified.mark}`,
         details: [],
         key: `tr-${i}`,
-        label: parsed.call
+        label: classified.label,
+        rune: classified.rune,
+        tone: classified.tone
       })
 
-      if (parsed.detail) {
+      if (classified.detail) {
         pushDetail({
-          color: parsed.mark === '✗' ? t.color.error : t.color.dim,
-          content: parsed.detail,
-          dimColor: parsed.mark !== '✗',
+          color: classified.tone === 'error' ? t.color.error : t.color.dim,
+          content: classified.detail,
+          dimColor: classified.tone !== 'error',
           key: `tr-${i}-d`
         })
       }
@@ -796,27 +802,30 @@ export const ToolTrail = memo(function ToolTrail({
       continue
     }
 
-    if (line.startsWith('drafting ')) {
-      const label = toolTrailLabel(line.slice(9).replace(/…$/, '').trim())
+    if (classified.tone === 'draft') {
+      const label = toolTrailLabel(classified.label)
 
       groups.push({
         color: t.color.cornsilk,
         content: label,
-        details: [{ color: t.color.dim, content: 'drafting...', dimColor: true, key: `tr-${i}-d` }],
+        details: [{ color: t.color.dim, content: classified.detail, dimColor: true, key: `tr-${i}-d` }],
         key: `tr-${i}`,
-        label
+        label,
+        rune: classified.rune,
+        tone: classified.tone
       })
 
       continue
     }
 
-    if (line === 'analyzing tool output…') {
+    if (classified.tone === 'analysis') {
       pushDetail({
         color: t.color.dim,
         dimColor: true,
         key: `tr-${i}`,
         content: groups.length ? (
           <>
+            <Text color={t.color.amber}>{classified.rune} </Text>
             <Spinner color={t.color.amber} variant="think" /> {line}
           </>
         ) : (
@@ -827,7 +836,7 @@ export const ToolTrail = memo(function ToolTrail({
       continue
     }
 
-    meta.push({ color: t.color.dim, content: line, dimColor: true, key: `tr-${i}` })
+    meta.push({ color: t.color.dim, content: `${classified.rune} ${line}`, dimColor: true, key: `tr-${i}` })
   }
 
   for (const tool of tools) {
@@ -838,6 +847,8 @@ export const ToolTrail = memo(function ToolTrail({
       key: tool.id,
       label,
       details: [],
+      rune: toolStreamRune('active'),
+      tone: 'active',
       content: (
         <>
           <Spinner color={t.color.amber} variant="tool" /> {label}
@@ -869,6 +880,16 @@ export const ToolTrail = memo(function ToolTrail({
   const thinkingTokensLabel = tokenCount > 0 ? `~${fmtK(tokenCount)} tokens` : null
 
   const toolTokensLabel = toolTokens !== undefined && toolTokens > 0 ? `~${fmtK(toolTokens)} tokens` : undefined
+  const activeToolCount = groups.filter(g => g.tone === 'active').length
+  const completedToolCount = groups.filter(g => g.tone === 'success').length
+  const failedToolCount = groups.filter(g => g.tone === 'error').length
+
+  const toolStreamSummary = buildToolStreamSummary({
+    active: activeToolCount,
+    completed: completedToolCount,
+    failed: failedToolCount,
+    tokensLabel: toolTokensLabel
+  })
 
   const totalTokensLabel = tokenCount > 0 && toolTokenCount > 0 ? `~${fmtK(totalTokenCount)} total` : null
   const delegateGroups = groups.filter(g => g.label.startsWith('Delegate Task'))
@@ -909,13 +930,16 @@ export const ToolTrail = memo(function ToolTrail({
   // hidden sections stay hidden so the override is honoured.
 
   const expandAll = () => {
-    if (visible.thinking !== 'hidden') setOpenThinking(true)
-    if (visible.tools !== 'hidden') setOpenTools(true)
+    if (visible.thinking !== 'hidden') {setOpenThinking(true)}
+
+    if (visible.tools !== 'hidden') {setOpenTools(true)}
+
     if (visible.subagents !== 'hidden') {
       setOpenSubagents(true)
       setDeepSubagents(true)
     }
-    if (visible.activity !== 'hidden') setOpenMeta(true)
+
+    if (visible.activity !== 'hidden') {setOpenMeta(true)}
   }
 
   const metaTone: 'dim' | 'error' | 'warn' = activity.some(i => i.tone === 'error')
@@ -960,7 +984,7 @@ export const ToolTrail = memo(function ToolTrail({
           }}
         >
           <Text color={t.color.dim} dim={!thinkingLive}>
-            <Text color={t.color.amber}>{visible.thinking === 'expanded' || openThinking ? '▾ ' : '▸ '}</Text>
+            <Text color={t.color.amber}>{openThinking ? '▾ ' : '▸ '}</Text>
             {thinkingLive ? (
               <Text bold color={t.color.cornsilk}>
                 Thinking
@@ -980,7 +1004,7 @@ export const ToolTrail = memo(function ToolTrail({
         </Box>
       ),
       key: 'thinking',
-      open: visible.thinking === 'expanded' || openThinking,
+      open: openThinking,
       render: rails => (
         <Thinking
           active={reasoningActive}
@@ -1007,14 +1031,14 @@ export const ToolTrail = memo(function ToolTrail({
               setOpenTools(v => !v)
             }
           }}
-          open={visible.tools === 'expanded' || openTools}
-          suffix={toolTokensLabel}
+          open={openTools}
+          suffix={toolStreamSummary || undefined}
           t={t}
-          title="Tool calls"
+          title="Tool stream"
         />
       ),
       key: 'tools',
-      open: visible.tools === 'expanded' || openTools,
+      open: openTools,
       render: rails => (
         <Box flexDirection="column">
           {groups.map((group, index) => {
@@ -1029,7 +1053,7 @@ export const ToolTrail = memo(function ToolTrail({
                   color={group.color}
                   content={
                     <>
-                      <Text color={t.color.amber}>● </Text>
+                      <Text color={group.tone === 'error' ? t.color.error : t.color.amber}>{group.rune} </Text>
                       {group.content}
                     </>
                   }
@@ -1072,14 +1096,14 @@ export const ToolTrail = memo(function ToolTrail({
               setDeepSubagents(false)
             }
           }}
-          open={visible.subagents === 'expanded' || openSubagents}
+          open={openSubagents}
           suffix={suffix}
           t={t}
           title="Spawn tree"
         />
       ),
       key: 'subagents',
-      open: visible.subagents === 'expanded' || openSubagents,
+      open: openSubagents,
       render: renderSubagentList
     })
   }
@@ -1096,14 +1120,14 @@ export const ToolTrail = memo(function ToolTrail({
               setOpenMeta(v => !v)
             }
           }}
-          open={visible.activity === 'expanded' || openMeta}
+          open={openMeta}
           t={t}
           title="Activity"
           tone={metaTone}
         />
       ),
       key: 'meta',
-      open: visible.activity === 'expanded' || openMeta,
+      open: openMeta,
       render: rails => (
         <Box flexDirection="column">
           {meta.map((row, index) => (
